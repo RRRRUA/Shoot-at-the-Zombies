@@ -32,17 +32,31 @@
 ## 快速开始
 
 ### 环境要求
-- Python 3.7+
 - Windows操作系统
+- Python 3.13+
+- [uv](https://docs.astral.sh/uv/)
 
 ### 安装依赖
+项目使用`uv`管理虚拟环境和依赖。进入项目根目录后执行：
+
 ```bash
-pip install pyautogui opencv-python pillow pynput pywin32
+uv sync
 ```
+
+`uv sync`会根据`pyproject.toml`和`uv.lock`创建或更新项目虚拟环境，并安装以下依赖：
+
+- `numpy`
+- `opencv-python`
+- `pillow`
+- `pyautogui`
+- `pynput`
+- `pywin32`
 
 ### 目录结构
 ```
 ├── game_bot.py        # 主脚本文件
+├── pyproject.toml      # 项目配置和依赖声明
+├── uv.lock             # uv锁定的依赖版本
 ├── config.json        # 配置文件（自动生成）
 ├── screenshots/       # 截图保存目录
 └── templates/         # 模板图片目录
@@ -57,12 +71,12 @@ pip install pyautogui opencv-python pillow pynput pywin32
 
 #### 方法1：图形界面
 ```bash
-python game_bot.py
+uv run python game_bot.py
 ```
 
 #### 方法2：命令行参数
 ```bash
-python game_bot.py --game_title "向僵尸开炮" --mode 0 --battle_count 10
+uv run python game_bot.py --game_title "向僵尸开炮" --mode 0 --battle_count 10
 ```
 
 ## 使用指南
