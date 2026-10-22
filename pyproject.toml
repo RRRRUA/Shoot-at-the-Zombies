@@ -7,7 +7,14 @@ authors = [
     { name = "RRRRUA", email = "603651718@qq.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "pillow",
+    "pyautogui",
+    "pynput",
+    "pywin32",
+]
 
 [project.scripts]
 shoot-at-the-zombies = "shoot_at_the_zombies:main"
