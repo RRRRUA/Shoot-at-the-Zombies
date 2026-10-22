@@ -36,6 +36,13 @@ SKILL_LIST = [
     {"name": "空投轰炸", "template": ["skill-kt.png", "skill-kt-1.png"]},
 ]
 
+# 窗口内容识别模板（可选）。
+# 将一个或多个固定不变的游戏界面区域放到 templates 目录，文件名使用
+# window-anchor*.png，例如 window-anchor.png、window-anchor-2.png。
+# 只要其中一张模板匹配成功，就认为找到了游戏窗口。
+WINDOW_CONTENT_TEMPLATE = "window-anchor.png"
+WINDOW_CONTENT_THRESHOLD = 0.82
+
 
 class GameBot:
     def __init__(
@@ -49,6 +56,8 @@ class GameBot:
         wait_time=60,
         quick_exit=False,
         background_mode=True,
+        window_content_template=None,
+        window_content_threshold=WINDOW_CONTENT_THRESHOLD,
     ):
         self.running = True
         self.hotkey_listener = None
@@ -60,6 +69,12 @@ class GameBot:
         self._peek_until = 0
         """初始化游戏机器人"""
         self.game_title = game_title
+        self.window_content_template = (
+            WINDOW_CONTENT_TEMPLATE
+            if window_content_template is None
+            else window_content_template
+        )
+        self.window_content_threshold = window_content_threshold
         # 后台模式：截图用PrintWindow、点击用PostMessage，不占用真实鼠标键盘
         self.background_mode = background_mode
         self.hwnd = None
@@ -449,9 +464,10 @@ class GameBot:
         # 脚本停止：恢复游戏窗口位置和样式
         self._restore_window_state()
 
-    def _capture_window(self):
+    def _capture_window(self, hwnd=None, update_geometry=True):
         """后台截图：PrintWindow抓取窗口内容（窗口可被遮挡，不能最小化）"""
-        hwnd = self._get_hwnd()
+        if hwnd is None:
+            hwnd = self._get_hwnd()
         if not hwnd:
             return None
 
@@ -504,13 +520,130 @@ class GameBot:
         if img.shape[1] != client_w or img.shape[0] != client_h:
             img = cv2.resize(img, (client_w, client_h))
 
-        # 刷新窗口位置（窗口被拖动后依然有效）
-        self.game_window = (client_origin[0], client_origin[1], client_w, client_h)
+        # 刷新窗口位置（窗口被拖动后依然有效）。
+        # 枚举候选窗口时不能把每个候选窗口都写入当前游戏窗口状态。
+        if update_geometry:
+            self.game_window = (client_origin[0], client_origin[1], client_w, client_h)
         return img
+
+    def _find_window_by_content(self):
+        """枚举顶层窗口，按固定界面模板查找游戏窗口。"""
+        configured_name = self.window_content_template
+        if isinstance(configured_name, (list, tuple)):
+            template_names = [name for name in configured_name if name]
+        elif configured_name:
+            template_names = [configured_name]
+        else:
+            template_names = []
+
+        # 自动加载 templates/window-anchor*.png，后续增加图片时无需再改代码。
+        if os.path.isdir(self.template_dir):
+            for filename in sorted(os.listdir(self.template_dir)):
+                lower_name = filename.lower()
+                if (
+                    lower_name.startswith("window-anchor")
+                    and lower_name.endswith((".png", ".jpg", ".jpeg"))
+                    and filename not in template_names
+                ):
+                    template_names.append(filename)
+
+        if not template_names:
+            return None
+
+        templates = []
+        for template_name in template_names:
+            template = self.template_cache.get(template_name)
+            if template is None:
+                template_path = os.path.join(self.template_dir, template_name)
+                template = cv2.imread(template_path)
+                if template is not None:
+                    self.template_cache[template_name] = template
+            if template is None:
+                print(f"窗口内容模板不存在: {template_name}")
+                continue
+            templates.append(
+                (template_name, cv2.cvtColor(template, cv2.COLOR_BGR2GRAY))
+            )
+
+        if not templates:
+            print("没有可用的窗口内容模板，将使用窗口标题查找")
+            return None
+
+        best_hwnd = None
+        best_score = -1.0
+        best_template_name = None
+
+        def check_window(hwnd, _extra):
+            nonlocal best_hwnd, best_score, best_template_name
+            try:
+                # 只检查可见、未最小化、尺寸足够大的顶层窗口。
+                if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+                    return
+                left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                if right - left <= 0 or bottom - top <= 0:
+                    return
+
+                img = self._capture_window(hwnd, update_geometry=False)
+                if img is None:
+                    return
+                img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                score = -1.0
+                matched_template_name = None
+
+                # 只要任意一张模板匹配成功即可；同时允许窗口在约 50%~200% 之间缩放。
+                for template_name, template_gray in templates:
+                    template_h, template_w = template_gray.shape[:2]
+                    for scale_index in range(31):
+                        scale = 0.5 + scale_index * 0.05
+                        scaled_w = max(1, int(template_w * scale))
+                        scaled_h = max(1, int(template_h * scale))
+                        if scaled_w > img_gray.shape[1] or scaled_h > img_gray.shape[0]:
+                            continue
+                        scaled_template = cv2.resize(
+                            template_gray,
+                            (scaled_w, scaled_h),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                        result = cv2.matchTemplate(
+                            img_gray, scaled_template, cv2.TM_CCOEFF_NORMED
+                        )
+                        _, current_score, _, _ = cv2.minMaxLoc(result)
+                        if current_score > score:
+                            score = current_score
+                            matched_template_name = template_name
+                if score > best_score:
+                    best_score = score
+                    best_hwnd = hwnd
+                    best_template_name = matched_template_name
+            except Exception:
+                # 某些系统窗口可能无法被 PrintWindow，跳过即可。
+                return
+
+        win32gui.EnumWindows(check_window, None)
+
+        if best_hwnd is not None and best_score >= self.window_content_threshold:
+            print(
+                f"按窗口内容找到游戏窗口: hwnd={best_hwnd}, "
+                f"匹配度={best_score:.3f}, 模板={best_template_name}"
+            )
+            return best_hwnd
+
+        if best_hwnd is not None:
+            print(
+                f"窗口内容匹配失败: 最高匹配度={best_score:.3f}，"
+                f"要求={self.window_content_threshold:.3f}"
+            )
+        return None
 
     def find_game_window(self):
         """查找游戏窗口（后台模式下不抢占前台）"""
-        hwnd = self._get_hwnd()
+        # 如果配置了固定界面模板，优先按窗口内容查找。
+        # 模板暂时为空或匹配失败时，退回标题查找，保持旧配置可用。
+        hwnd = self._find_window_by_content()
+        if hwnd:
+            self.hwnd = hwnd
+        else:
+            hwnd = self._get_hwnd()
         if hwnd:
             if not self.background_mode:
                 win32gui.SetForegroundWindow(hwnd)
@@ -524,44 +657,45 @@ class GameBot:
 
     def resize_game_window(self, width=542, height=1010):
         """调整游戏窗口大小，并确保窗口处于屏幕内可见位置（便于PrintWindow截图）"""
-        hwnd = win32gui.FindWindow(None, self.game_title)
-        if hwnd:
-            # 最小化窗口无法调整，先恢复
-            if win32gui.IsIconic(hwnd):
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                time.sleep(0.3)
-            # 获取当前窗口位置
-            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-            # 计算窗口边框和标题栏的大小
-            # 先获取客户区大小
-            client_rect = win32gui.GetClientRect(hwnd)
-            client_width = client_rect[2] - client_rect[0]
-            client_height = client_rect[3] - client_rect[1]
-            # 计算边框和标题栏的总大小
-            border_width = (right - left) - client_width
-            border_height = (bottom - top) - client_height
-            # 计算需要设置的窗口总大小
-            window_width = width + border_width
-            window_height = height + border_height
-            # 若窗口被移出屏幕外，放回屏幕内可见位置（主屏居中偏右上）
-            vx = win32api.GetSystemMetrics(76)
-            vy = win32api.GetSystemMetrics(77)
-            vw = win32api.GetSystemMetrics(78)
-            vh = win32api.GetSystemMetrics(79)
-            if right <= vx or bottom <= vy or left >= vx + vw or top >= vy + vh:
-                left = vx + vw - window_width - 40
-                top = vy + 40
-                if left < vx:
-                    left = vx
-            # 设置新的窗口大小
-            win32gui.MoveWindow(hwnd, left, top, window_width, window_height, True)
-            # 更新游戏窗口信息
-            self.game_window = (left, top, width, height)
-            print(f"游戏窗口已调整为: {self.game_window}")
-            return True
-        else:
+        # 与主循环统一：优先按窗口内容查找，模板为空时再按标题查找。
+        if not self.find_game_window():
             print("未找到游戏窗口，无法调整大小")
             return False
+
+        hwnd = self.hwnd
+        # 最小化窗口无法调整，先恢复
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            time.sleep(0.3)
+        # 获取当前窗口位置
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        # 计算窗口边框和标题栏的大小
+        # 先获取客户区大小
+        client_rect = win32gui.GetClientRect(hwnd)
+        client_width = client_rect[2] - client_rect[0]
+        client_height = client_rect[3] - client_rect[1]
+        # 计算边框和标题栏的总大小
+        border_width = (right - left) - client_width
+        border_height = (bottom - top) - client_height
+        # 计算需要设置的窗口总大小
+        window_width = width + border_width
+        window_height = height + border_height
+        # 若窗口被移出屏幕外，放回屏幕内可见位置（主屏居中偏右上）
+        vx = win32api.GetSystemMetrics(76)
+        vy = win32api.GetSystemMetrics(77)
+        vw = win32api.GetSystemMetrics(78)
+        vh = win32api.GetSystemMetrics(79)
+        if right <= vx or bottom <= vy or left >= vx + vw or top >= vy + vh:
+            left = vx + vw - window_width - 40
+            top = vy + 40
+            if left < vx:
+                left = vx
+        # 设置新的窗口大小
+        win32gui.MoveWindow(hwnd, left, top, window_width, window_height, True)
+        # 更新游戏窗口信息
+        self.game_window = (left, top, width, height)
+        print(f"游戏窗口已调整为: {self.game_window}")
+        return True
 
     def find_fullscreen_window(self):
         """查找全屏幕窗口"""
